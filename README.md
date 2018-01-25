@@ -2,8 +2,16 @@
 redis prefix analyse
 analyse which prefix used most
 
+unlike https://github.com/xueqiu/rdr we analyse only key and it's count ,
+so we can't get memory consume each prefix, but just get a bref report of keys in redis instead.
+
+it is a small and convenient util and do not need rdb file , just scan and detect prefix with trie tree
+pre-build release can be found at https://github.com/TimothyZhang023/redis_tool/releases 
+
+
 ```
 redis_tool-linux64-1.2 -h 127.0.0.1 -p 6379
+more args can be found by --help
 ```
 
 ```
