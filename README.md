@@ -1,11 +1,11 @@
-# redis_tool
-redis prefix analyse
-analyse which prefix used most
+# redis prefix analyse  
+analyse which prefix used most  
 
 unlike https://github.com/xueqiu/rdr we analyse only key and it's count  
-so we can't get precise memory consume each prefix, but just get a brief report of keys in redis instead.
-from v1.3 we can calculate memory consume by command dump, it requires high bandwidths and may block redis,
-so use it on slave node when --size is on.
+so we can't get precise memory consume each prefix, but just get a brief report of keys in redis instead.  
+
+from v1.3 we can calculate memory consume by command dump, it requires high bandwidths and may block redis,  
+so use it on slave node when --size is on.  
 
 it is a small and convenient util and do not need rdb file , just scan and detect prefix with trie tree  
 pre-build release can be found at https://github.com/TimothyZhang023/redis_tool/releases 
