@@ -2,7 +2,7 @@
 
 cd "$( dirname "${BASH_SOURCE[0]}" )"
 
-version=1.3
+version=1.4
 echo "creating tool binary version $version"
 
 mkdir -p ../bin
@@ -22,7 +22,7 @@ build() {
         goarm="GOARM=$armv"
     fi
 
-    name=redis_tool-$arch-$version
+    name=redis_prefix_analyse-$arch-$version
     echo "building $name"
     echo $cgo $goos $goarch $goarm go build \"-ldflags=-s -w\"
     eval $cgo $goos $goarch $goarm go build \"-ldflags=-s -w\" || exit 1

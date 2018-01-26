@@ -163,12 +163,12 @@ func (b *TrieCounter) Do(client *redis.Client, keysD []string) (err error) {
 
 			if funcName(key, b.SummaryKeys) {
 				keys = append(keys, key)
-				break
+				continue
 			}
 
 			if funcName(key, b.DetailKeys) {
 				keys = append(keys, key)
-				break
+				continue
 			}
 		}
 

@@ -12,7 +12,7 @@ pre-build release can be found at https://github.com/TimothyZhang023/redis_tool/
 
 
 ```
-redis_tool-linux64-1.2 -h 127.0.0.1 -p 6379
+redis_prefix_analyse-linux64-1.4 -h 127.0.0.1 -p 6379
 more args can be found by --help
 use  -readonly --size on slave node to get memory consume report
 ```
