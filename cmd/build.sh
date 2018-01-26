@@ -2,7 +2,7 @@
 
 cd "$( dirname "${BASH_SOURCE[0]}" )"
 
-version=1.2
+version=1.3
 echo "creating tool binary version $version"
 
 mkdir -p ../bin

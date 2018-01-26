@@ -9,22 +9,27 @@ import (
 	"sort"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/fvbock/trie"
 	"gopkg.in/redis.v5"
 
 	"errors"
-	"io"
+	"sync"
 )
 
 var Quit = make(chan bool, 2)
 
+var TYPENAMES = [6]string{"unknown", "string", "list", "set", "hash", "zset"}
+
 var (
-	ip          = flag.String("h", "127.0.0.1", "ip")
+	host        = flag.String("h", "127.0.0.1", "host")
 	port        = flag.Int("p", 6379, "port")
 	action      = flag.String("action", "prefix", "操作 prefix...")
 	scanPattern = flag.String("scan-pattern", "*", "scan匹配模式")
+	sizeStat    = flag.Bool("size", false, "key size 统计")
+	readOnly    = flag.Bool("readonly", false, "slave readonly")
+
+	pipe = flag.Int64("pipe", 1000, "pipeline每次获取数量大小")
 
 	prefixMaxDetect   = flag.Int("prefix-max-detect", 40, "最大前缀探测长度")
 	prefixMinMembers  = flag.Int("prefix-min-members", 10, "前缀探测最低子元素个数,小于这个值则停止向后探测")
@@ -39,9 +44,9 @@ func main() {
 	var err error
 
 	opt := redis.Options{
-		ReadTimeout: time.Duration(2000) * time.Millisecond,
-		DialTimeout: time.Duration(2000) * time.Millisecond,
-		Addr:        fmt.Sprintf("%s:%d", *ip, *port),
+		ReadTimeout: -1,
+		Addr:        fmt.Sprintf("%s:%d", *host, *port),
+		ReadOnly:    *readOnly,
 	}
 
 	var client = redis.NewClient(&opt)
@@ -55,23 +60,24 @@ func main() {
 		Quit <- true
 	}()
 
-	fmt.Println(*action, "started ")
+	fmt.Println(*action, "started")
 	switch *action {
 	case "prefix":
 		go func() {
 			var tc = NewTrieCounter()
 
-			fmt.Printf("[PREFIX] try sample at least %d keys", *prefixSamples)
+			fmt.Printf("[PREFIX] try sample at least %d keys\n", *prefixSamples)
 
-			err = ScanAndProcess(client, *scanPattern, tc, func() bool {
+			err = ScanAndProcess(client, *pipe, *scanPattern, tc, func() bool {
 				return !tc.scanEnd
 			})
 
-			fmt.Printf("[PREFIX] total sample count: %d\n", tc.keyCnt)
-			tc.Process()
-			tc.PrintAllStat()
+			fmt.Printf("[PREFIX] total samples count: %d\n", tc.keyCnt)
+			tc.ProcessSamples()
+			//tc.PrintAllStat()
+			fmt.Printf("[PREFIX] process samples done, cntMapSummary:%d cntMapSummary:%d\n", len(tc.cntMapSummary), len(tc.cntMapDetail))
 
-			err = ScanAndProcess(client, *scanPattern, tc, func() bool {
+			err = ScanAndProcess(client, *pipe, *scanPattern, tc, func() bool {
 				return true
 			})
 
@@ -105,15 +111,23 @@ func waitingForQuit() {
 	}
 }
 
+type KeyProcess interface {
+	Do(c *redis.Client, p []string) (err error)
+}
+
 type TrieCounter struct {
-	t             *trie.Trie
-	sampleEnd     bool
-	scanEnd       bool
-	keyCnt        int64
-	samples       int64
-	minPrefixCnt  int64
-	cntMapSummary map[string]int64
-	cntMapDetail  map[string]int64
+	t              *trie.Trie
+	sampleEnd      bool
+	scanEnd        bool
+	keyCnt         int64
+	samples        int64
+	minPrefixCnt   int64
+	cntMapSummary  map[string]int64
+	SummaryKeys    []string
+	cntMapDetail   map[string]int64
+	DetailKeys     []string
+	cntMapValueLen map[string]int64
+	cntMapType     map[string]int
 }
 
 func NewTrieCounter() *TrieCounter {
@@ -123,45 +137,146 @@ func NewTrieCounter() *TrieCounter {
 	tc.minPrefixCnt = *prefixMinPrefix
 	tc.cntMapSummary = make(map[string]int64, tc.minPrefixCnt)
 	tc.cntMapDetail = make(map[string]int64, tc.minPrefixCnt)
+	tc.cntMapValueLen = make(map[string]int64, tc.minPrefixCnt)
+	tc.cntMapType = make(map[string]int, tc.minPrefixCnt)
 	return &tc
 }
 
-func (b *TrieCounter) Write(p []byte) (n int, err error) {
-
-	key := strings.Trim(string(p), "\n")
-	if b.sampleEnd {
-		b.keyCnt++
-		if b.keyCnt%800000 == 0 {
-			fmt.Printf("processed %d keys\n", b.keyCnt)
+func funcName(key string, prefixs []string) bool {
+	for _, prefix := range prefixs {
+		if strings.HasPrefix(key, prefix) {
+			return true
 		}
+	}
+	return false
+}
 
-		for prefix, v := range b.cntMapSummary {
-			if strings.HasPrefix(key, prefix) {
-				b.cntMapSummary[prefix] = v + 1
+func (b *TrieCounter) Do(client *redis.Client, keysD []string) (err error) {
+	if b.sampleEnd {
+
+		var keys []string
+		for _, key := range keysD {
+			b.keyCnt++
+			if b.keyCnt%100000 == 0 {
+				fmt.Printf("processed %d keys\n", b.keyCnt)
+			}
+
+			if funcName(key, b.SummaryKeys) {
+				keys = append(keys, key)
+				break
+			}
+
+			if funcName(key, b.DetailKeys) {
+				keys = append(keys, key)
 				break
 			}
 		}
 
-		for prefix, v := range b.cntMapDetail {
-			if strings.HasPrefix(key, prefix) {
-				b.cntMapDetail[prefix] = v + 1
-			}
+		if len(keys) == 0 {
+			return
 		}
 
-		return len(p), nil
+		typeMap := make(map[string]string, len(keys))
+		sizeMap := make(map[string]int, len(keys))
+
+		if *sizeStat {
+			wg := &sync.WaitGroup{}
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				pipeline := client.Pipeline()
+				defer pipeline.Close()
+
+				for _, key := range keys {
+					pipeline.Type(key)
+				}
+
+				Cmders, _ := pipeline.Exec()
+				for i, c := range Cmders {
+					cmder := c.(*redis.StatusCmd)
+					types, err := cmder.Result()
+					if err != nil {
+						typeMap[keys[i]] = "unknown"
+						fmt.Fprintln(os.Stderr, err)
+						continue
+					}
+					typeMap[keys[i]] = types
+				}
+			}()
+
+			go func() {
+				defer wg.Done()
+				pipeline := client.Pipeline()
+				defer pipeline.Close()
+
+				for _, key := range keys {
+					pipeline.Dump(key)
+				}
+				Cmders, _ := pipeline.Exec()
+				for i, c := range Cmders {
+					cmder := c.(*redis.StringCmd)
+					val, err := cmder.Result()
+					if err != nil {
+						fmt.Fprintln(os.Stderr, err)
+						sizeMap[keys[i]] = 0
+						continue
+					}
+					sizeMap[keys[i]] = len(val)
+				}
+			}()
+			wg.Wait()
+		}
+
+		for _, key := range keys {
+			for prefix, keyCnt := range b.cntMapSummary {
+				if strings.HasPrefix(key, prefix) {
+					b.cntMapSummary[prefix] = keyCnt + 1
+					b.recordType(typeMap, key, prefix)
+					b.recordSize(sizeMap, key, prefix)
+					break
+				}
+			}
+
+			for prefix, keyCnt := range b.cntMapDetail {
+				if strings.HasPrefix(key, prefix) {
+					b.cntMapDetail[prefix] = keyCnt + 1
+					b.recordType(typeMap, key, prefix)
+					b.recordSize(sizeMap, key, prefix)
+				}
+			}
+		}
 	} else {
-		b.keyCnt++
-		if b.keyCnt > b.samples {
-			b.scanEnd = true
-			if b.ValidPrefixCnt() < b.minPrefixCnt {
-				b.scanEnd = false
+		for _, key := range keysD {
+			b.keyCnt++
+			if b.keyCnt > b.samples {
+				b.scanEnd = true
+				if b.ValidPrefixCnt() < b.minPrefixCnt {
+					b.scanEnd = false
+				}
+			}
+			b.t.Add(key)
+		}
+	}
+	return nil
+}
+func (b *TrieCounter) recordSize(sizeMap map[string]int, key string, prefix string) {
+	if _, ok := sizeMap[key]; ok {
+		if _, ok := b.cntMapValueLen[prefix]; ok {
+			b.cntMapValueLen[prefix] = b.cntMapValueLen[prefix] + int64(sizeMap[key])
+		} else {
+			b.cntMapValueLen[prefix] = int64(sizeMap[key])
+		}
+	}
+}
+func (b *TrieCounter) recordType(typeMap map[string]string, key string, prefix string) {
+	if tname, ok := typeMap[key]; ok {
+		for index, value := range TYPENAMES {
+			if value == tname {
+				b.cntMapType[prefix] = b.cntMapType[prefix] | 2<<uint(index)
+				break
 			}
 		}
-
-		b.t.Add(key)
-		return len(p), nil
 	}
-
 }
 
 func (b *TrieCounter) ValidPrefixCnt() (n int64) {
@@ -173,7 +288,7 @@ func (b *TrieCounter) ValidPrefixCnt() (n int64) {
 	return n
 }
 
-func (b *TrieCounter) Process() {
+func (b *TrieCounter) ProcessSamples() {
 
 	for fb, br := range b.t.Root.Branches {
 		if !br.End && len(br.LeafValue) > 2 {
@@ -185,7 +300,7 @@ func (b *TrieCounter) Process() {
 
 			members := b.t.PrefixMembersList(prefix)
 			if len(members) > *prefixMinMembers {
-				pf := b.process2(prefix, members, "")
+				pf := b.processDetail(prefix, members, "")
 				for _, p := range pf {
 					b.cntMapDetail[p] = 0
 				}
@@ -196,12 +311,16 @@ func (b *TrieCounter) Process() {
 	b.keyCnt = 0       //reset
 	b.scanEnd = false  //reset
 	b.sampleEnd = true //reset
+
+	b.SummaryKeys = mapKeySet(b.cntMapSummary)
+	b.DetailKeys = mapKeySet(b.cntMapDetail)
+
 }
 
-func (b *TrieCounter) process2(parent string, members []string, trim string) (pf []string) {
+func (b *TrieCounter) processDetail(parent string, members []string, trim string) (pf []string) {
 	tempTrie := trie.NewTrie()
 
-	//log.Dev("** process2", parent, members)
+	//log.Dev("** processDetail", parent, members)
 	for _, item := range members {
 		tempTrie.Add(strings.TrimPrefix(strings.TrimPrefix(item, parent), trim))
 	}
@@ -218,7 +337,7 @@ func (b *TrieCounter) process2(parent string, members []string, trim string) (pf
 
 					members := tempTrie.PrefixMembersList(prefix)
 					if len(members) > *prefixMinMembers {
-						tpf := b.process2(parent+prefix, members, prefix)
+						tpf := b.processDetail(parent+prefix, members, prefix)
 						//log.Dev("tpf", len(tpf), tpf)
 						if len(tpf) > *prefixDetailLevel {
 							pf = append(pf, tpf...)
@@ -232,17 +351,38 @@ func (b *TrieCounter) process2(parent string, members []string, trim string) (pf
 }
 
 func (b *TrieCounter) PrintAllStat() {
-	fmt.Println("---------------------Summary--------------------")
-	for _, k := range mapKeySet(b.cntMapSummary) {
-		fmt.Printf("|    %-42s %d\n", k, b.cntMapSummary[k])
+	fmt.Println("-------------------------------------------Summary-----------------------------------------")
+	fmt.Printf(" %-42s %-10s %-10s %-13s %-10s\n", "PREFIX", "count", "avg-size", "total(byte)", "type(psb)")
+
+	for _, prefix := range b.SummaryKeys {
+		cnt := b.cntMapSummary[prefix]
+		total := b.cntMapValueLen[prefix]
+		typeN := getTypeName(b.cntMapType[prefix])
+		avg := int64(0)
+		if cnt != 0 {
+			avg = total / cnt
+		}
+		fmt.Printf(" %-42s %-10d %-10d %-13d %+v\n", prefix, cnt, avg, total, typeN)
 	}
-	fmt.Printf("---------------------Summary<%d>--------------------\n", len(b.cntMapSummary))
+	fmt.Printf("-------------------------------------------Summary<%d>---------------------------------------\n",
+		len(b.cntMapSummary))
+
 	fmt.Println("")
-	fmt.Println("**********************Detail**********************")
-	for _, k := range mapKeySet(b.cntMapDetail) {
-		fmt.Printf("|    %-42s %d\n", k, b.cntMapDetail[k])
+
+	fmt.Println("*****************************************Detail*****************************************")
+	fmt.Printf(" %-42s %-10s %-10s %-13s %-10s\n", "PREFIX", "count", "avg-size", "total(byte)", "type(psb)")
+	for _, prefix := range b.DetailKeys {
+		cnt := b.cntMapDetail[prefix]
+		total := b.cntMapValueLen[prefix]
+		typeN := getTypeName(b.cntMapType[prefix])
+		avg := int64(0)
+		if cnt != 0 {
+			avg = total / cnt
+		}
+		fmt.Printf(" %-42s %-10d %-10d %-13d %+v\n", prefix, cnt, avg, total, typeN)
 	}
-	fmt.Printf("**********************Detail<%d>**********************\n", len(b.cntMapDetail))
+	fmt.Printf("*****************************************Detail<%d>**************************************\n",
+		len(b.cntMapDetail))
 	fmt.Println("")
 }
 
@@ -255,11 +395,19 @@ func mapKeySet(m map[string]int64) []string {
 	return keys
 }
 
-func ScanAndProcess(client *redis.Client, pattern string, keyWriter io.Writer, continueFunc func() bool) error {
+func getTypeName(ti int) (types []string) {
+	for i := 0; i < len(TYPENAMES); i++ {
+		if ti == (2 << uint(i)) {
+			types = append(types, TYPENAMES[i])
+		}
+	}
+	return
+}
+
+func ScanAndProcess(client *redis.Client, count int64, pattern string, p KeyProcess, continueFunc func() bool) error {
 	fmt.Println(client.String(), "scan keys for pattern :", pattern)
 
 	cursor := uint64(0)
-	count := int64(100)
 
 	var err error
 
@@ -277,8 +425,11 @@ func ScanAndProcess(client *redis.Client, pattern string, keyWriter io.Writer, c
 			break
 		}
 
-		for _, key := range keys {
-			fmt.Fprintln(keyWriter, key)
+		if len(keys) > 0 {
+			err = p.Do(client, keys)
+		}
+		if err != nil {
+			break
 		}
 
 		cursor = c
