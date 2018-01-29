@@ -272,7 +272,7 @@ func (b *TrieCounter) recordType(typeMap map[string]string, key string, prefix s
 	if tname, ok := typeMap[key]; ok {
 		for index, value := range TYPENAMES {
 			if value == tname {
-				b.cntMapType[prefix] = b.cntMapType[prefix] | 2<<uint(index)
+				b.cntMapType[prefix] = b.cntMapType[prefix] | 1<<uint(index)
 				break
 			}
 		}
@@ -397,7 +397,7 @@ func mapKeySet(m map[string]int64) []string {
 
 func getTypeName(ti int) (types []string) {
 	for i := 0; i < len(TYPENAMES); i++ {
-		if ti == (2 << uint(i)) {
+		if 1 & (ti >> uint(i)) !=0 {
 			types = append(types, TYPENAMES[i])
 		}
 	}
