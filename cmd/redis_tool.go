@@ -26,11 +26,11 @@ var (
 	port        = flag.Int("p", 6379, "port")
 	action      = flag.String("action", "prefix", "操作 prefix...")
 	scanPattern = flag.String("scan-pattern", "*", "scan匹配模式")
-	sizeStat    = flag.Bool("size", false, "key size 统计")
 	readOnly    = flag.Bool("readonly", false, "slave readonly")
 
 	pipe = flag.Int64("pipe", 1000, "pipeline每次获取数量大小")
 
+	sizeStat    = flag.Bool("size", false, "前缀统计数中key dump统计")
 	prefixMaxDetect   = flag.Int("prefix-max-detect", 40, "最大前缀探测长度")
 	prefixMinMembers  = flag.Int("prefix-min-members", 10, "前缀探测最低子元素个数,小于这个值则停止向后探测")
 	prefixDetailLevel = flag.Int("prefix-detail-level", 2, "前缀探测详细等级,子元素个数超过这个值则继续增长prefix")
@@ -75,7 +75,7 @@ func main() {
 			fmt.Printf("[PREFIX] total samples count: %d\n", tc.keyCnt)
 			tc.ProcessSamples()
 			//tc.PrintAllStat()
-			fmt.Printf("[PREFIX] process samples done, cntMapSummary:%d cntMapSummary:%d\n", len(tc.cntMapSummary), len(tc.cntMapDetail))
+			fmt.Printf("[PREFIX] process samples done, cntMapSummary:%d cntMapDetail:%d\n", len(tc.cntMapSummary), len(tc.cntMapDetail))
 
 			err = ScanAndProcess(client, *pipe, *scanPattern, tc, func() bool {
 				return true
